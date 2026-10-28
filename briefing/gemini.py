@@ -45,8 +45,11 @@ def _call(model, body):
         data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json", "x-goog-api-key": os.environ["GEMINI_API_KEY"]},
     )
-    with urllib.request.urlopen(req, timeout=300) as r:
-        return json.load(r)
+    t0 = time.time()
+    with urllib.request.urlopen(req, timeout=150) as r:
+        data = json.load(r)
+    print("  [%s] %.0fs" % (model, time.time() - t0), flush=True)
+    return data
 
 
 def generate(prompt, search=True, temperature=0.7, max_tokens=8192, retries=5):

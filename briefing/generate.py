@@ -148,7 +148,9 @@ def main():
     ]
 
     print(f"生成 {args.date} {SLOT_CN[args.slot]} ...")
-    sections = [write_section(ctx, *row) for row in plan]
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=int(os.environ.get("GEN_WORKERS", "4"))) as pool:
+        sections = list(pool.map(lambda row: write_section(ctx, *row), plan))
 
     outline = "\n".join(f"{s['title']}：{'、'.join(s['heads'][:4])}" for s in sections)
     oc, _ = gemini.generate(f"""你是「澳洲新生活·每日观察」的主播。今天北京时间 {args.date}，{SLOT_CN[args.slot]}。本期各段内容要点：

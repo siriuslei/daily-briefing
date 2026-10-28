@@ -32,6 +32,7 @@ jobs:
     environment:
       name: github-pages
     env:
+      PYTHONUNBUFFERED: "1"
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
       PROFILE_MD: ${{ secrets.PROFILE_MD }}
@@ -64,7 +65,8 @@ jobs:
           echo "SEND_NOW=$SEND_NOW" >> $GITHUB_ENV
           echo "SEND_AT=$(TZ=Asia/Shanghai date -d "today $T" +%s)" >> $GITHUB_ENV
 
-      - name: 写稿（Gemini + 谷歌搜索）
+      - name: 写稿（新闻素材 + Gemini）
+        timeout-minutes: 35
         run: python -m briefing.generate --slot "$SLOT"
 
       - name: 检查是否有新一期

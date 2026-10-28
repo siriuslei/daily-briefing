@@ -16,7 +16,7 @@ STATE = os.path.join(ROOT, "state", "history.json")
 OUT = os.path.join(ROOT, "out")
 BJT = dt.timezone(dt.timedelta(hours=8))
 SLOT_CN = {"morning": "早报", "evening": "晚报"}
-CHARS_PER_MIN = 310  # Yunxi +5% 语速实测约每分钟 310 字（含停顿）
+CHARS_PER_MIN = 330  # Yunxi +5% 语速实测约每分钟 330 字（含停顿）
 
 STYLE = """【播报风格】
 - 节目名「澳洲新生活·每日观察」，主播用第一人称“我”，像一位懂行的朋友在车上跟听众聊天。
@@ -56,7 +56,7 @@ def section_prompt(ctx, title, minutes, brief, avoid):
 
 {avoid}
 
-只依据上面提供的新闻素材、行情数据和你有把握的背景知识来写，素材里没有的最新事实不要编造，挑最重要的讲而不是逐条罗列。直接输出这一段的口播稿，约 {n} 字（不少于 {int(n*0.9)} 字），不要加标题，开头用一句自然的过渡引入本段。
+只依据上面提供的新闻素材、行情数据和你有把握的背景知识来写，素材里没有的最新事实不要编造，挑最重要的讲而不是逐条罗列。直接输出这一段的口播稿，{int(n*0.9)} 到 {int(n*1.1)} 字（严格控制篇幅，这一段约 {minutes} 分钟），不要加标题，开头用一句自然的过渡引入本段。
 口播稿写完后，单独一行写 ===要点===，下一行给出一个 JSON 字符串数组，列出本段讲到的每条新闻或主题的简短标题（每条 15 字以内），用于以后去重。"""
 
 
@@ -85,6 +85,11 @@ def write_section(ctx, title, minutes, brief, avoid, items=()):
             f"补充背景、逻辑分析和对听众的影响。保持口语风格，直接输出扩写后的全文，不要任何说明。\n\n{body}",
             search=False)
         body = re.sub(r"[*#>`_]+", "", more).strip()
+    if len(body) > target * 1.25:  # 太长就压缩，保证整期约 20 分钟
+        short, _ = gemini.generate(
+            f"下面这段口播稿有 {len(body)} 字，请压缩到约 {int(target)} 字：保留最重要的事实、判断和对听众的影响，"
+            f"删掉次要细节。保持口语风格，直接输出压缩后的全文，不要任何说明。\n\n{body}", search=False)
+        body = re.sub(r"[*#>`_]+", "", short).strip()
     print(f"  {title}: {len(body)} 字, {len(heads)} 条要点")
     return {"title": title, "body": body, "heads": heads, "sources": sources}
 
@@ -134,7 +139,7 @@ def main():
 
     plan = [
         ("澳洲要闻速览", 1.5, "挑 2 到 3 条过去 24 小时内澳洲（尤其悉尼/新州）最重要的新闻：利率、房租房价、移民签证、生活成本、政策等，讲清对一个刚到悉尼的家庭有什么影响。" + m("australia"), avoid, mat["australia"]),
-        ("澳洲文化与历史", 3.5, topic_brief("culture", "讲得有故事性，最后落到“这对我融入当地有什么帮助”，比如和同事、邻居相处时可以怎么用。"), ""),
+        ("澳洲文化与历史", 3, topic_brief("culture", "讲得有故事性，最后落到“这对我融入当地有什么帮助”，比如和同事、邻居相处时可以怎么用。"), ""),
         ("行业观察", 3, topic_brief("industry", "面向在悉尼做幕墙、门窗、扶手栏杆的从业者：讲清规范/标准要点、相关大公司与竞争情况、近期景气度或大项目，尽量给具体可用的信息；如有本周相关行业新闻可先简短带一句。") + m("industry"), avoid, mat["industry"]),
         ("澳洲生活小课堂", 3, topic_brief("life", "讲实操：步骤、费用大概多少、常见坑、需要准备什么，帮助一家人尽快适应悉尼生活。"), ""),
         ("中国要闻", 3, "挑 2 到 3 条过去 24 小时中国最重要的新闻：经济数据、重大政策、中澳关系、人民币汇率等，讲背后逻辑与影响。" + m("china"), avoid, mat["china"]),

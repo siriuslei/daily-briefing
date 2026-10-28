@@ -1,0 +1,10 @@
+name: 诊断 Gemini
+on: workflow_dispatch
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m briefing.diagnose
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}

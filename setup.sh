@@ -9,7 +9,8 @@ REPO_NAME="${REPO_NAME:-daily-briefing}"
 step() { printf "\n\033[1;32m== %s\033[0m\n" "$1"; }
 
 step "1/7 GitHub 登录"
-command -v gh >/dev/null || brew install gh
+export PATH="$HOME/.local/bin:$PATH"
+command -v gh >/dev/null || { echo "缺少 gh，请先安装 GitHub CLI"; exit 1; }
 gh auth status >/dev/null 2>&1 || gh auth login -w -p https
 OWNER=$(gh api user -q .login)
 

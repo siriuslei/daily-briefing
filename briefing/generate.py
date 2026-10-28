@@ -1,0 +1,198 @@
+"""生成一期播报：选题 → 分栏目联网写稿 → 拼成脚本 → 更新去重历史。
+
+用法: python -m briefing.generate --slot morning|evening [--date YYYY-MM-DD]
+输出: out/<name>.md、out/<name>.txt（朗读稿）、out/meta.json
+"""
+import argparse
+import datetime as dt
+import json
+import os
+import re
+
+from . import gemini, topics
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+STATE = os.path.join(ROOT, "state", "history.json")
+OUT = os.path.join(ROOT, "out")
+BJT = dt.timezone(dt.timedelta(hours=8))
+SLOT_CN = {"morning": "早报", "evening": "晚报"}
+CHARS_PER_MIN = 310  # Yunxi +5% 语速实测约每分钟 310 字（含停顿）
+
+STYLE = """【播报风格】
+- 节目名「澳洲新生活·每日观察」，主播用第一人称“我”，像一位懂行的朋友在车上跟听众聊天。
+- 每条新闻按“发生了什么 → 背后的逻辑 → 对我们（准备在悉尼生活、在门窗幕墙栏杆行业工作的一家人）意味着什么”来讲，要有自己的判断，敢下结论，但区分事实和观点。
+- 口语化、短句，可用“好，我们来看下一条”“说白了”“这件事有意思的地方在于”等过渡；不要念网址、不要用列表符号、不要用 Markdown。
+- 数字要口语化（如“大概百分之四点一”而不是“4.1%”），英文专有名词首次出现时给中文解释。
+- 只讲有可靠来源的事实，日期要准确；不确定的就不说。"""
+
+AVOID_TMPL = """【去重要求】下面是最近几期已经讲过的内容。不要重复；如果某件事有重大新进展，只讲新进展，并一句话带过背景：
+{items}"""
+
+
+def load_history():
+    if os.path.exists(STATE):
+        with open(STATE, encoding="utf-8") as f:
+            return json.load(f)
+    return {"episodes": []}
+
+
+def next_topic(pool, used, key):
+    for t in pool:
+        if t not in used:
+            return t
+    return None  # 主题库用完，交给模型自选
+
+
+def section_prompt(ctx, title, minutes, brief, avoid):
+    n = int(minutes * CHARS_PER_MIN)
+    return f"""你是一档中文通勤音频节目的撰稿人。今天是北京时间 {ctx['date']}，这是{ctx['slot_cn']}（{ctx['slot_focus']}）。
+
+{ctx['profile']}
+
+{STYLE}
+
+【本段任务：{title}】
+{brief}
+
+{avoid}
+
+请先用搜索核实最新信息，然后直接输出这一段的口播稿，约 {n} 字（不少于 {int(n*0.9)} 字），不要加标题，开头用一句自然的过渡引入本段。
+口播稿写完后，单独一行写 ===要点===，下一行给出一个 JSON 字符串数组，列出本段讲到的每条新闻或主题的简短标题（每条 15 字以内），用于以后去重。"""
+
+
+def parse(text):
+    if "===要点===" in text:
+        body, tail = text.split("===要点===", 1)
+        m = re.search(r"\[.*\]", tail, re.S)
+        try:
+            heads = json.loads(m.group(0)) if m else []
+        except ValueError:
+            heads = []
+    else:
+        body, heads = text, []
+    body = re.sub(r"[*#>`_]+", "", body).strip()
+    return body, [str(h) for h in heads]
+
+
+def write_section(ctx, title, minutes, brief, avoid):
+    text, sources = gemini.generate(section_prompt(ctx, title, minutes, brief, avoid))
+    body, heads = parse(text)
+    target = minutes * CHARS_PER_MIN
+    if len(body) < target * 0.7:  # 太短就让模型扩写一次
+        more, s2 = gemini.generate(
+            f"下面这段口播稿只有 {len(body)} 字，请在不改变事实的前提下扩写到约 {int(target)} 字，"
+            f"补充背景、逻辑分析和对听众的影响。保持口语风格，直接输出扩写后的全文，不要任何说明。\n\n{body}",
+            search=False)
+        body = re.sub(r"[*#>`_]+", "", more).strip()
+        sources += s2
+    print(f"  {title}: {len(body)} 字, {len(heads)} 条要点")
+    return {"title": title, "body": body, "heads": heads, "sources": sources}
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--slot", choices=["morning", "evening"], required=True)
+    ap.add_argument("--date", default=dt.datetime.now(BJT).strftime("%Y-%m-%d"))
+    args = ap.parse_args()
+
+    hist = load_history()
+    eps = hist["episodes"]
+    if any(e["date"] == args.date and e["slot"] == args.slot for e in eps):
+        print("本期已生成过，跳过")
+        return
+
+    profile = os.environ.get("PROFILE_MD", "").strip()
+    finance = os.environ.get("FINANCE_MD", "").strip()
+    ctx = {
+        "date": args.date,
+        "slot_cn": SLOT_CN[args.slot],
+        "slot_focus": "重点：隔夜美欧市场与全球大事、中国早间政策与经济数据" if args.slot == "morning"
+        else "重点：澳洲当天新闻、中国白天动态、欧洲开盘前瞻",
+        "profile": "【听众档案】\n" + (profile or "准备移居悉尼，公司 DW Building 位于悉尼 Padstow，行业是幕墙、扶手栏杆、门窗；计划先在公司附近租房。"),
+    }
+
+    recent = eps[-8:]
+    recent_heads = [h for e in recent for h in e.get("heads", [])]
+    avoid = AVOID_TMPL.format(items="；".join(recent_heads) or "（暂无）")
+    used = {k: [e.get(k) for e in eps if e.get(k)] for k in ("culture", "industry", "life")}
+
+    picks = {}
+    for key, pool in (("culture", topics.CULTURE), ("industry", topics.INDUSTRY), ("life", topics.LIFE)):
+        picks[key] = next_topic(pool, used[key], key)
+
+    def topic_brief(key, desc):
+        if picks[key]:
+            return f"本期主题：「{picks[key]}」。{desc}"
+        return f"自选一个之前没讲过的主题（已讲过：{'；'.join(used[key])}）。{desc}"
+
+    plan = [
+        ("澳洲要闻速览", 1.5, "挑 2 到 3 条过去 24 小时内澳洲（尤其悉尼/新州）最重要的新闻：利率、房租房价、移民签证、生活成本、政策等，讲清对一个刚到悉尼的家庭有什么影响。", avoid),
+        ("澳洲文化与历史", 3.5, topic_brief("culture", "讲得有故事性，最后落到“这对我融入当地有什么帮助”，比如和同事、邻居相处时可以怎么用。"), ""),
+        ("行业观察", 3, topic_brief("industry", "面向在悉尼做幕墙、门窗、扶手栏杆的从业者：讲清规范/标准要点、相关大公司与竞争情况、近期景气度或大项目，尽量给具体可用的信息；如有本周相关行业新闻可先简短带一句。"), avoid),
+        ("澳洲生活小课堂", 3, topic_brief("life", "讲实操：步骤、费用大概多少、常见坑、需要准备什么，帮助一家人尽快适应悉尼生活。"), ""),
+        ("中国要闻", 3, "挑 2 到 3 条过去 24 小时中国最重要的新闻：经济数据、重大政策、中澳关系、人民币汇率等，讲背后逻辑与影响。", avoid),
+        ("全球大事", 3, "挑 2 到 3 条过去 24 小时全球最重要的事：地缘政治、美联储与美国经济、大宗商品等，讲对澳洲和中国的连带影响。", avoid),
+        ("理财观察", 2.5, ("固定跟踪三个品种：纳斯达克指数、标普500指数、黄金。先用搜索核实最新收盘价和近一周涨跌幅，"
+                         "再结合本期讲到的宏观形势（美联储与利率预期、美债收益率、美元、财报、地缘风险）分析各自的趋势和关键价位，"
+                         "最后对三个品种分别给出今天的观察倾向：偏买入、偏卖出或观望，说明理由，以及什么情况下这个判断会失效。"
+                         f"\n【听众理财策略】\n{finance or '关注纳斯达克、标普500和黄金三个品种的短线买卖时机。'}"
+                       "\n结尾必须原话说一句：“以上只是我的个人观察，仅供参考，不构成投资建议，我也不是持牌理财顾问。”"), ""),
+    ]
+
+    print(f"生成 {args.date} {SLOT_CN[args.slot]} ...")
+    sections = [write_section(ctx, t, m, b, a) for t, m, b, a in plan]
+
+    outline = "\n".join(f"{s['title']}：{'、'.join(s['heads'][:4])}" for s in sections)
+    oc, _ = gemini.generate(f"""你是「澳洲新生活·每日观察」的主播。今天北京时间 {args.date}，{SLOT_CN[args.slot]}。本期各段内容要点：
+{outline}
+
+{STYLE}
+
+请输出三部分，用单独一行的 ===分隔=== 隔开：
+1. 开场白，约 250 字：问好、报日期和是早报还是晚报，用一两句话勾出今天最值得听的看点。
+2. 结尾，约 250 字：用三句话回顾今天最重要的结论，提醒一件今天可以去做的小事，然后道别。
+3. 本期主题词：不超过 10 个汉字，用于文件名，不要标点。""", search=False)
+    parts = [re.sub(r"[*#>`_]+", "", p).strip() for p in oc.split("===分隔===")]
+    opening, closing = parts[0], parts[1] if len(parts) > 1 else "好，今天就聊到这里，我们下期见。"
+    theme = re.sub(r"[^\w一-鿿]", "", parts[2] if len(parts) > 2 else "")[:10] or sections[0]["heads"][0][:10]
+
+    name = f"{args.date}_{SLOT_CN[args.slot]}_{theme}"
+    spoken = "\n\n".join([opening] + [s["body"] for s in sections] + [closing])
+
+    md = [f"# {name}\n", f"> 澳洲新生活·每日观察 · {args.date} {SLOT_CN[args.slot]} · 约 {len(spoken)//CHARS_PER_MIN} 分钟\n",
+          "## 开场\n", opening, ""]
+    for s in sections:
+        md += [f"## {s['title']}\n", s["body"], ""]
+    md += ["## 结尾\n", closing, "", "## 参考来源\n"]
+    seen = set()
+    for s in sections:
+        for src in s["sources"]:
+            if src.get("uri") not in seen:
+                seen.add(src.get("uri"))
+                md.append(f"- [{src.get('title', '来源')}]({src.get('uri')})")
+
+    os.makedirs(OUT, exist_ok=True)
+    with open(os.path.join(OUT, name + ".md"), "w", encoding="utf-8") as f:
+        f.write("\n".join(md))
+    with open(os.path.join(OUT, name + ".txt"), "w", encoding="utf-8") as f:
+        f.write(spoken)
+
+    meta = {"name": name, "date": args.date, "slot": args.slot, "slot_cn": SLOT_CN[args.slot], "theme": theme,
+            "chars": len(spoken), "outline": [{"title": s["title"], "heads": s["heads"]} for s in sections]}
+    with open(os.path.join(OUT, "meta.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=1)
+
+    eps.append({"date": args.date, "slot": args.slot, "name": name,
+                "heads": [h for s in sections if s["title"] not in ("澳洲文化与历史", "澳洲生活小课堂", "理财观察") for h in s["heads"]],
+                "culture": picks["culture"] or (sections[1]["heads"] or [""])[0],
+                "industry": picks["industry"] or (sections[2]["heads"] or [""])[0],
+                "life": picks["life"] or (sections[3]["heads"] or [""])[0]})
+    hist["episodes"] = eps[-200:]
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    with open(STATE, "w", encoding="utf-8") as f:
+        json.dump(hist, f, ensure_ascii=False, indent=1)
+    print(f"完成：{name}（{len(spoken)} 字）")
+
+
+if __name__ == "__main__":
+    main()

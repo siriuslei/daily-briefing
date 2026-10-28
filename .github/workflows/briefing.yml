@@ -1,0 +1,119 @@
+name: 每日观察播报
+
+on:
+  schedule:
+    - cron: "40 22 * * *"   # 北京时间 06:40 开始生成 → 07:30 发出早报
+    - cron: "10 8 * * *"    # 北京时间 16:10 开始生成 → 17:00 发出晚报
+  workflow_dispatch:
+    inputs:
+      slot:
+        description: "早报 morning / 晚报 evening"
+        type: choice
+        options: [morning, evening]
+        default: morning
+      send_now:
+        description: "生成完立即发送（不等到 7:30 / 17:00）"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: briefing
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    environment:
+      name: github-pages
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-2.5-flash' }}
+      PROFILE_MD: ${{ secrets.PROFILE_MD }}
+      FINANCE_MD: ${{ secrets.FINANCE_MD }}
+      PAGES_TOKEN: ${{ secrets.PAGES_TOKEN }}
+      PAGES_BASE: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
+      GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+      QUARK_KEY: ${{ secrets.QUARK_KEY }}
+      QUARK_FOLDER_FID: ${{ vars.QUARK_FOLDER_FID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: pip install edge-tts
+
+      - name: 确定早报/晚报与发送时间
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            SLOT="${{ inputs.slot }}"; SEND_NOW="${{ inputs.send_now }}"
+          else
+            H=$(TZ=Asia/Shanghai date +%H); SEND_NOW=false
+            if [ "$H" -lt 12 ]; then SLOT=morning; else SLOT=evening; fi
+          fi
+          if [ "$SLOT" = morning ]; then T="07:30"; else T="17:00"; fi
+          echo "SLOT=$SLOT" >> $GITHUB_ENV
+          echo "SEND_NOW=$SEND_NOW" >> $GITHUB_ENV
+          echo "SEND_AT=$(TZ=Asia/Shanghai date -d "today $T" +%s)" >> $GITHUB_ENV
+
+      - name: 写稿（Gemini + 谷歌搜索）
+        run: python -m briefing.generate --slot "$SLOT"
+
+      - name: 检查是否有新一期
+        id: chk
+        run: if [ -f out/meta.json ]; then echo "new=true" >> $GITHUB_OUTPUT; fi
+
+      - name: 语音合成
+        if: steps.chk.outputs.new == 'true'
+        run: |
+          NAME=$(python -c "import json;print(json.load(open('out/meta.json'))['name'])")
+          python -m briefing.tts "out/$NAME.txt" "out/$NAME.mp3"
+
+      - name: 更新倍速播放页
+        if: steps.chk.outputs.new == 'true'
+        run: |
+          mkdir site
+          if git fetch origin gh-pages --depth=1; then git --work-tree=site checkout origin/gh-pages -- .; git reset -q; fi
+          python -m briefing.pages site out
+          cd site
+          git init -q -b gh-pages
+          git config user.name "briefing-bot"; git config user.email "briefing-bot@users.noreply.github.com"
+          git add -A; git commit -qm "episodes"
+          git push -qf "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" gh-pages
+      - uses: actions/upload-pages-artifact@v3
+        if: steps.chk.outputs.new == 'true'
+        with:
+          path: site
+      - uses: actions/deploy-pages@v4
+        if: steps.chk.outputs.new == 'true'
+
+      - name: 上传夸克网盘
+        if: steps.chk.outputs.new == 'true'
+        continue-on-error: true
+        run: bash briefing/quark_upload.sh out
+
+      - name: 等到发送时间
+        if: steps.chk.outputs.new == 'true' && env.SEND_NOW != 'true'
+        run: |
+          WAIT=$(( SEND_AT - $(date +%s) ))
+          if [ "$WAIT" -gt 0 ]; then echo "等待 ${WAIT}s"; sleep "$WAIT"; fi
+
+      - name: 发邮件
+        if: steps.chk.outputs.new == 'true'
+        run: python -m briefing.send_email out
+
+      - name: 保存去重历史与登录态
+        if: always() && steps.chk.outputs.new == 'true'
+        run: |
+          git config user.name "briefing-bot"; git config user.email "briefing-bot@users.noreply.github.com"
+          git add state/
+          git diff --cached --quiet || git commit -qm "state: $SLOT $(TZ=Asia/Shanghai date +%F)"
+          git pull -q --rebase && git push -q

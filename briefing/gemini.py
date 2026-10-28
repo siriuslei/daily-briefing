@@ -6,68 +6,84 @@ import time
 import urllib.error
 import urllib.request
 
-API = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-_model = None
+BASE = "https://generativelanguage.googleapis.com/v1beta/models"
+_candidates = None
 
 
-def pick_model():
-    """优先用 GEMINI_MODEL；否则从可用模型里选最新的 flash（旧型号下线后自动跟进）。"""
-    global _model
-    if _model:
-        return _model
-    want = os.environ.get("GEMINI_MODEL", "").strip()
-    req = urllib.request.Request("https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000",
-                                 headers={"x-goog-api-key": os.environ["GEMINI_API_KEY"]})
+def candidates():
+    """可用模型按优先级排序：GEMINI_MODEL 优先，其后新版 flash → flash-lite → 其他。
+    免费档里新模型常常没有额度，遇到额度超限会依次换下一个。"""
+    global _candidates
+    if _candidates is not None:
+        return _candidates
+    req = urllib.request.Request(BASE + "?pageSize=1000", headers={"x-goog-api-key": os.environ["GEMINI_API_KEY"]})
     with urllib.request.urlopen(req, timeout=60) as r:
         models = [m["name"].split("/", 1)[1] for m in json.load(r).get("models", [])
                   if "generateContent" in m.get("supportedGenerationMethods", [])]
-    if want in models:
-        _model = want
-    else:
-        def score(n):
-            nums = [float(x) for x in re.findall(r"(\d+(?:\.\d+)?)", n.split("-")[1])] if "-" in n else [0]
-            return (nums[0] if nums else 0, "preview" not in n and "exp" not in n, "latest" in n)
-        flash = [m for m in models if m.startswith("gemini-") and "flash" in m and "lite" not in m
-                 and not any(k in m for k in ("image", "tts", "audio", "live", "embedding", "thinking"))]
-        _model = max(flash or models, key=score)
-    print("使用模型:", _model)
-    return _model
+    models = [m for m in models if m.startswith("gemini-")
+              and not any(k in m for k in ("image", "tts", "audio", "live", "embedding", "robotics", "computer"))]
+
+    def score(n):
+        v = re.match(r"gemini-(\d+(?:\.\d+)?)", n)
+        tier = 2 if "flash" in n and "lite" not in n else 1 if "lite" in n else 0
+        stable = "preview" not in n and "exp" not in n
+        return (tier, stable, float(v.group(1)) if v else 0)
+
+    ordered = sorted(models, key=score, reverse=True)
+    want = os.environ.get("GEMINI_MODEL", "").strip()
+    if want in ordered:
+        ordered.remove(want)
+        ordered.insert(0, want)
+    _candidates = ordered
+    print("候选模型:", ", ".join(ordered[:8]))
+    return _candidates
 
 
-def generate(prompt, search=True, temperature=0.7, max_tokens=8192, retries=6):
+def _call(model, body):
+    req = urllib.request.Request(
+        "%s/%s:generateContent" % (BASE, model),
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json", "x-goog-api-key": os.environ["GEMINI_API_KEY"]},
+    )
+    with urllib.request.urlopen(req, timeout=300) as r:
+        return json.load(r)
+
+
+def generate(prompt, search=True, temperature=0.7, max_tokens=8192, retries=5):
     """返回 (正文, 来源列表[{title, uri}])。"""
-    model = pick_model()
     body = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens},
     }
     if search:
         body["tools"] = [{"google_search": {}}]
-    req = urllib.request.Request(
-        API.format(model=model),
-        data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json", "x-goog-api-key": os.environ["GEMINI_API_KEY"]},
-    )
-    delay = 15
-    for attempt in range(retries):
-        try:
-            with urllib.request.urlopen(req, timeout=300) as r:
-                data = json.load(r)
-            cand = data["candidates"][0]
-            text = "".join(p.get("text", "") for p in cand.get("content", {}).get("parts", []))
-            if not text.strip():
-                raise ValueError("empty response: %s" % cand.get("finishReason"))
-            chunks = cand.get("groundingMetadata", {}).get("groundingChunks", [])
-            sources = [c["web"] for c in chunks if "web" in c]
-            return text.strip(), sources
-        except urllib.error.HTTPError as e:
-            msg = e.read().decode(errors="ignore")[:300]
-            if e.code not in (429, 500, 502, 503, 504) or attempt == retries - 1:
-                raise RuntimeError("Gemini %s: %s" % (e.code, msg))
-            print("Gemini %s, retry in %ss" % (e.code, delay))
-        except (urllib.error.URLError, TimeoutError, ValueError, KeyError) as e:
-            if attempt == retries - 1:
-                raise
-            print("Gemini error %r, retry in %ss" % (e, delay))
-        time.sleep(delay)
-        delay = min(delay * 2, 120)
+    cands = candidates()
+    while cands:
+        model = cands[0]
+        delay = 15
+        for attempt in range(retries):
+            try:
+                data = _call(model, body)
+                cand = data["candidates"][0]
+                text = "".join(p.get("text", "") for p in cand.get("content", {}).get("parts", []))
+                if not text.strip():
+                    raise ValueError("empty response: %s" % cand.get("finishReason"))
+                chunks = cand.get("groundingMetadata", {}).get("groundingChunks", [])
+                return text.strip(), [c["web"] for c in chunks if "web" in c]
+            except urllib.error.HTTPError as e:
+                msg = e.read().decode(errors="ignore")
+                # 额度为 0 或日额度用完：换下一个模型；分钟级限速：等一会儿重试
+                if e.code == 429 and ("limit: 0" in msg or "PerDay" in msg) or e.code in (400, 403, 404):
+                    print("模型 %s 不可用 (%s)，换下一个" % (model, e.code))
+                    break
+                if e.code not in (429, 500, 502, 503, 504):
+                    raise RuntimeError("Gemini %s: %s" % (e.code, msg[:500]))
+                print("%s %s，%ss 后重试" % (model, e.code, delay))
+            except (urllib.error.URLError, TimeoutError, ValueError, KeyError) as e:
+                print("%s 出错 %r，%ss 后重试" % (model, e, delay))
+            time.sleep(delay)
+            delay = min(delay * 2, 90)
+        else:
+            print("模型 %s 多次失败，换下一个" % model)
+        cands.pop(0)
+    raise RuntimeError("所有 Gemini 模型都不可用")

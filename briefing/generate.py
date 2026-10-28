@@ -9,7 +9,7 @@ import json
 import os
 import re
 
-from . import gemini, topics
+from . import gemini, news, topics
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATE = os.path.join(ROOT, "state", "history.json")
@@ -56,7 +56,7 @@ def section_prompt(ctx, title, minutes, brief, avoid):
 
 {avoid}
 
-请先用搜索核实最新信息，然后直接输出这一段的口播稿，约 {n} 字（不少于 {int(n*0.9)} 字），不要加标题，开头用一句自然的过渡引入本段。
+只依据上面提供的新闻素材、行情数据和你有把握的背景知识来写，素材里没有的最新事实不要编造，挑最重要的讲而不是逐条罗列。直接输出这一段的口播稿，约 {n} 字（不少于 {int(n*0.9)} 字），不要加标题，开头用一句自然的过渡引入本段。
 口播稿写完后，单独一行写 ===要点===，下一行给出一个 JSON 字符串数组，列出本段讲到的每条新闻或主题的简短标题（每条 15 字以内），用于以后去重。"""
 
 
@@ -74,8 +74,9 @@ def parse(text):
     return body, [str(h) for h in heads]
 
 
-def write_section(ctx, title, minutes, brief, avoid):
-    text, sources = gemini.generate(section_prompt(ctx, title, minutes, brief, avoid))
+def write_section(ctx, title, minutes, brief, avoid, items=()):
+    text, _ = gemini.generate(section_prompt(ctx, title, minutes, brief, avoid), search=False)
+    sources = [{"title": it["title"], "uri": it["link"]} for it in items]
     body, heads = parse(text)
     target = minutes * CHARS_PER_MIN
     if len(body) < target * 0.7:  # 太短就让模型扩写一次
@@ -84,7 +85,6 @@ def write_section(ctx, title, minutes, brief, avoid):
             f"补充背景、逻辑分析和对听众的影响。保持口语风格，直接输出扩写后的全文，不要任何说明。\n\n{body}",
             search=False)
         body = re.sub(r"[*#>`_]+", "", more).strip()
-        sources += s2
     print(f"  {title}: {len(body)} 字, {len(heads)} 条要点")
     return {"title": title, "body": body, "heads": heads, "sources": sources}
 
@@ -125,22 +125,30 @@ def main():
             return f"本期主题：「{picks[key]}」。{desc}"
         return f"自选一个之前没讲过的主题（已讲过：{'；'.join(used[key])}）。{desc}"
 
+    print("抓取新闻素材 ...")
+    mat = {c: news.gather(c) for c in news.FEEDS}
+    market = news.market_snapshot()
+    for c, items in mat.items():
+        print(f"  {c}: {len(items)} 条")
+    m = lambda c: "\n【今日新闻素材】\n" + news.as_text(mat[c])
+
     plan = [
-        ("澳洲要闻速览", 1.5, "挑 2 到 3 条过去 24 小时内澳洲（尤其悉尼/新州）最重要的新闻：利率、房租房价、移民签证、生活成本、政策等，讲清对一个刚到悉尼的家庭有什么影响。", avoid),
+        ("澳洲要闻速览", 1.5, "挑 2 到 3 条过去 24 小时内澳洲（尤其悉尼/新州）最重要的新闻：利率、房租房价、移民签证、生活成本、政策等，讲清对一个刚到悉尼的家庭有什么影响。" + m("australia"), avoid, mat["australia"]),
         ("澳洲文化与历史", 3.5, topic_brief("culture", "讲得有故事性，最后落到“这对我融入当地有什么帮助”，比如和同事、邻居相处时可以怎么用。"), ""),
-        ("行业观察", 3, topic_brief("industry", "面向在悉尼做幕墙、门窗、扶手栏杆的从业者：讲清规范/标准要点、相关大公司与竞争情况、近期景气度或大项目，尽量给具体可用的信息；如有本周相关行业新闻可先简短带一句。"), avoid),
+        ("行业观察", 3, topic_brief("industry", "面向在悉尼做幕墙、门窗、扶手栏杆的从业者：讲清规范/标准要点、相关大公司与竞争情况、近期景气度或大项目，尽量给具体可用的信息；如有本周相关行业新闻可先简短带一句。") + m("industry"), avoid, mat["industry"]),
         ("澳洲生活小课堂", 3, topic_brief("life", "讲实操：步骤、费用大概多少、常见坑、需要准备什么，帮助一家人尽快适应悉尼生活。"), ""),
-        ("中国要闻", 3, "挑 2 到 3 条过去 24 小时中国最重要的新闻：经济数据、重大政策、中澳关系、人民币汇率等，讲背后逻辑与影响。", avoid),
-        ("全球大事", 3, "挑 2 到 3 条过去 24 小时全球最重要的事：地缘政治、美联储与美国经济、大宗商品等，讲对澳洲和中国的连带影响。", avoid),
-        ("理财观察", 2.5, ("固定跟踪三个品种：纳斯达克指数、标普500指数、黄金。先用搜索核实最新收盘价和近一周涨跌幅，"
+        ("中国要闻", 3, "挑 2 到 3 条过去 24 小时中国最重要的新闻：经济数据、重大政策、中澳关系、人民币汇率等，讲背后逻辑与影响。" + m("china"), avoid, mat["china"]),
+        ("全球大事", 3, "挑 2 到 3 条过去 24 小时全球最重要的事：地缘政治、美联储与美国经济、大宗商品等，讲对澳洲和中国的连带影响。" + m("world"), avoid, mat["world"]),
+        ("理财观察", 2.5, ("固定跟踪三个品种：纳斯达克指数、标普500指数、黄金。根据下面的行情数据讲清最新点位和近一周、近一个月的涨跌，"
                          "再结合本期讲到的宏观形势（美联储与利率预期、美债收益率、美元、财报、地缘风险）分析各自的趋势和关键价位，"
                          "最后对三个品种分别给出今天的观察倾向：偏买入、偏卖出或观望，说明理由，以及什么情况下这个判断会失效。"
                          f"\n【听众理财策略】\n{finance or '关注纳斯达克、标普500和黄金三个品种的短线买卖时机。'}"
-                       "\n结尾必须原话说一句：“以上只是我的个人观察，仅供参考，不构成投资建议，我也不是持牌理财顾问。”"), ""),
+                       "\n结尾必须原话说一句：“以上只是我的个人观察，仅供参考，不构成投资建议，我也不是持牌理财顾问。”"
+                         "\n【最新行情数据】\n" + market + m("markets")), "", mat["markets"]),
     ]
 
     print(f"生成 {args.date} {SLOT_CN[args.slot]} ...")
-    sections = [write_section(ctx, t, m, b, a) for t, m, b, a in plan]
+    sections = [write_section(ctx, *row) for row in plan]
 
     outline = "\n".join(f"{s['title']}：{'、'.join(s['heads'][:4])}" for s in sections)
     oc, _ = gemini.generate(f"""你是「澳洲新生活·每日观察」的主播。今天北京时间 {args.date}，{SLOT_CN[args.slot]}。本期各段内容要点：

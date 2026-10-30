@@ -2,8 +2,11 @@ name: 每日观察播报
 
 on:
   schedule:
-    - cron: "40 22 * * *"   # 北京时间 06:40 开始生成 → 07:30 发出早报
-    - cron: "10 8 * * *"    # 北京时间 16:10 开始生成 → 17:00 发出晚报
+    # GitHub 定时任务常常延迟数小时，所以每个时段设多个触发点；已生成过的会自动跳过。
+    # 早报：北京时间 03:00–06:30 每半小时一次 → 统一等到 07:30 发出
+    - cron: "0,30 19-22 * * *"
+    # 晚报：北京时间 12:00–16:00 每半小时一次 → 统一等到 17:00 发出
+    - cron: "0,30 4-8 * * *"
   workflow_dispatch:
     inputs:
       slot:
@@ -28,7 +31,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 350
     environment:
       name: github-pages
     env:
@@ -54,6 +57,7 @@ jobs:
 
       - name: 确定早报/晚报与发送时间
         run: |
+          git pull -q --ff-only origin main   # 定时任务可能排队很久，取最新去重记录
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             SLOT="${{ inputs.slot }}"; SEND_NOW="${{ inputs.send_now }}"
           else
